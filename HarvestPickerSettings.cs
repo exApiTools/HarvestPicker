@@ -25,4 +25,8 @@ public class HarvestPickerSettings : ISettings
     public RangeNode<int> SeedsPerT3Plant { get; set; } = new RangeNode<int>(100, 0, 300);
     public RangeNode<int> SeedsPerT4Plant { get; set; } = new RangeNode<int>(500, 0, 900);
     public RangeNode<float> T4PlantWhiteSeedChance { get; set; } = new RangeNode<float>(0.1f, 0, 1f);
+
+    public RangeNode<float> CropRotationT1UpgradeChance { get; set; } = new RangeNode<float>(0.33f, 0, 1f);
+    public RangeNode<float> CropRotationT2UpgradeChance { get; set; } = new RangeNode<float>(0.33f, 0, 1f);
+    public RangeNode<float> CropRotationT3UpgradeChance { get; set; } = new RangeNode<float>(0.33f, 0, 1f);
 }

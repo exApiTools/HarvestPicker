@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -14,6 +15,8 @@ using HarvestPicker.Api.Request;
 using HarvestPicker.Api.Response;
 using Newtonsoft.Json;
 using SharpDX;
+using Vector2 = System.Numerics.Vector2;
+using static MoreLinq.Extensions.PermutationsExtension;
 
 namespace HarvestPicker;
 
@@ -41,7 +44,18 @@ public class HarvestPicker : BaseSettingsPlugin<HarvestPickerSettings>
     private Task _pricesGetter;
     private HarvestPrices _prices;
     private List<((Entity, double), (Entity, double))> _irrigatorPairs;
+    private List<Entity> _cropRotationPath;
+    private double _cropRotationValue;
+    private HashSet<(SeedData, SeedData)> _lastSeedData;
     private string CachePath => Path.Join(ConfigDirectory, "pricecache.json");
+
+    public override void AreaChange(AreaInstance area)
+    {
+        _lastSeedData = null;
+        _cropRotationPath = null;
+        _cropRotationValue = 0;
+        _irrigatorPairs = new List<((Entity, double), (Entity, double))>();
+    }
 
     private HarvestPrices Prices
     {
@@ -159,10 +173,11 @@ public class HarvestPicker : BaseSettingsPlugin<HarvestPickerSettings>
     public override Job Tick()
     {
         _irrigatorPairs = new List<((Entity, double), (Entity, double))>();
+
         var irrigators = GameController.EntityListWrapper.ValidEntitiesByType[EntityType.MiscellaneousObjects]
-            .Where(x => x.Path == "Metadata/MiscellaneousObjects/Harvest/Irrigator" &&
+            .Where(x => x.Path == "Metadata/MiscellaneousObjects/Harvest/Extractor" &&
                         x.TryGetComponent<StateMachine>(out var stateMachine) &&
-                        stateMachine.States.FirstOrDefault(s => s.Name == "colour")?.Value is { } and not 0).ToList();
+                        stateMachine.States.FirstOrDefault(s => s.Name == "current_state")?.Value == 0).ToList();
         var irrigatorPairs = new List<((Entity, double), (Entity, double))>();
         while (irrigators.LastOrDefault() is { } entity1)
         {
@@ -180,7 +195,126 @@ public class HarvestPicker : BaseSettingsPlugin<HarvestPickerSettings>
         }
 
         _irrigatorPairs = irrigatorPairs;
+
+        if (GameController.IngameState.Data.MapStats.GetValueOrDefault(
+                GameStat.MapHarvestSeedsOfOtherColoursHaveChanceToUpgradeOnCompletingPlot) != 0)
+        {
+            //crop rotation
+            List<((SeedData Data, Entity Entity) Plot1, (SeedData Data, Entity Entity) Plot2)> irrigatorSeedDataPairs =
+                irrigatorPairs.Select(p => (
+                        (ExtractSeedData(p.Item1.Item1), p.Item1.Item1),
+                        (p.Item2.Item1 != null ? ExtractSeedData(p.Item2.Item1) : null, p.Item2.Item1)))
+                    .ToList();
+            var currentSet = irrigatorSeedDataPairs.Select(x => (x.Plot1.Data, x.Plot2.Data)).ToHashSet();
+            if (_lastSeedData == null || !_lastSeedData.SetEquals(currentSet))
+            {
+                _cropRotationPath = null;
+                _cropRotationValue = 0;
+
+                SeedData Upgrade(SeedData source, int type) => source == null || type == source.Type
+                    ? source
+                    : new SeedData(source.Type,
+                        source.T1Plants * (1 - Settings.CropRotationT1UpgradeChance),
+                        source.T2Plants * (1 - Settings.CropRotationT2UpgradeChance) + source.T1Plants * Settings.CropRotationT1UpgradeChance,
+                        source.T3Plants * (1 - Settings.CropRotationT3UpgradeChance) + source.T2Plants * Settings.CropRotationT2UpgradeChance,
+                        source.T4Plants + source.T3Plants * Settings.CropRotationT3UpgradeChance);
+
+
+                double maxValue = double.NegativeInfinity;
+                List<Entity> selectedPath = null;
+
+                foreach (var pairPermutation in irrigatorSeedDataPairs.Permutations())
+                {
+                    var choices = new List<ImmutableList<bool>> { ImmutableList<bool>.Empty };
+                    foreach (var irrigatorSeedDataPair in pairPermutation)
+                    {
+                        choices = irrigatorSeedDataPair.Plot2.Data == null
+                            ? choices.Select(x => x.Add(false)).ToList()
+                            : choices.SelectMany(x => new[] { x.Add(false), x.Add(true) }).ToList();
+                    }
+
+
+                    foreach (var choice in choices.Select(x => x))
+                    {
+                        var iterationSeedDataPairs = pairPermutation.Reverse().ToList();
+                        var actuallyPickedPlants = new List<(SeedData Data, Entity Entity)>();
+                        foreach (var choiceItem in choice)
+                        {
+                            var pair = iterationSeedDataPairs.Last();
+                            iterationSeedDataPairs.RemoveAt(iterationSeedDataPairs.Count - 1);
+                            var completedPair = choiceItem ? pair.Plot2 : pair.Plot1;
+                            iterationSeedDataPairs = iterationSeedDataPairs.Select(x => (
+                                (Upgrade(x.Plot1.Data, completedPair.Data.Type), x.Plot1.Entity),
+                                (Upgrade(x.Plot2.Data, completedPair.Data.Type), x.Plot2.Entity)
+                            )).ToList();
+                            actuallyPickedPlants.Add(completedPair);
+                        }
+
+                        var value = actuallyPickedPlants.Select(x => x.Data).Sum(CalculateIrrigatorValue);
+                        if (value > maxValue)
+                        {
+                            maxValue = value;
+                            selectedPath = pairPermutation.Zip(choice, (pair, c) => c ? pair.Plot2.Entity : pair.Plot1.Entity).ToList();
+                        }
+                    }
+
+
+                    _cropRotationPath = selectedPath;
+                    _cropRotationValue = maxValue;
+                    _lastSeedData = currentSet;
+                }
+            }
+        }
+
         return null;
+    }
+
+    private record SeedData(int Type, float T1Plants, float T2Plants, float T3Plants, float T4Plants);
+
+    private SeedData ExtractSeedData(Entity e)
+    {
+        if (!e.TryGetComponent<HarvestWorldObject>(out var harvest))
+        {
+            Log($"Entity {e} has no harvest component");
+            return new SeedData(1, 0, 0, 0, 0);
+        }
+
+        var seeds = harvest.Seeds;
+        if (seeds.Any(x => x.Seed == null))
+        {
+            Log("Some seeds have no associated dat file");
+            return new SeedData(1, 0, 0, 0, 0);
+        }
+
+        var type = seeds.GroupBy(x => x.Seed.Type).MaxBy(x => x.Count()).Key;
+        var seedsByTier = seeds.ToLookup(x => x.Seed.Tier);
+        return new SeedData(type,
+            seedsByTier[1].Sum(x => x.Count),
+            seedsByTier[2].Sum(x => x.Count),
+            seedsByTier[3].Sum(x => x.Count),
+            seedsByTier[4].Sum(x => x.Count));
+    }
+
+    private double CalculateIrrigatorValue(SeedData data)
+    {
+        var prices = Prices;
+        if (prices == null)
+        {
+            LogMessage("Prices are still not loaded, unable to calculate values");
+            return 0;
+        }
+
+        var typeToPrice = data.Type switch
+        {
+            1 => prices.PurpleJuiceValue,
+            2 => prices.YellowJuiceValue,
+            3 => prices.BlueJuiceValue,
+            _ => LogWrongType(data.Type),
+        };
+        return Settings.SeedsPerT1Plant * typeToPrice * data.T1Plants +
+               Settings.SeedsPerT2Plant * typeToPrice * data.T2Plants +
+               Settings.SeedsPerT3Plant * typeToPrice * data.T3Plants +
+               (Settings.SeedsPerT4Plant * typeToPrice + Settings.T4PlantWhiteSeedChance * prices.WhiteJuiceValue) * data.T4Plants;
     }
 
     private double CalculateIrrigatorValue(Entity e)
@@ -261,6 +395,18 @@ public class HarvestPicker : BaseSettingsPlugin<HarvestPickerSettings>
                 };
                 DrawIrrigatorValue(irrigator1, value1, color1);
                 DrawIrrigatorValue(irrigator2, value2, color2);
+            }
+        }
+
+        if (_cropRotationPath is { } path)
+        {
+            for (int i = 0; i < path.Count; i++)
+            {
+                var entity = path[i];
+                var text = $"CR: this is your choice index {i}. Total EV: {_cropRotationValue:F1}";
+                var textPosition = GameController.IngameState.Camera.WorldToScreen(entity.PosNum) + new Vector2(0, Graphics.MeasureText("V").Y);
+                Graphics.DrawBox(textPosition, textPosition + Graphics.MeasureText(text), Color.Black);
+                Graphics.DrawText(text, textPosition, i == 0 ? Settings.GoodColor : Settings.NeutralColor);
             }
         }
     }
